@@ -4,7 +4,7 @@ Resilient bulk store scoring and tiering. TierForge ingests a CSV of stores, enr
 rate-limited and flaky Enrichment API, then scores and tiers every store (Large / Medium / Small) from
 user-configured bars and weights.
 
-> Status: Phase 2 done (CSV upload, enrichment job engine). Features land phase by phase.
+> Status: Phase 3 done (CSV upload, enrichment job engine with full failure handling). Features land phase by phase.
 
 ## Prerequisites
 
@@ -43,15 +43,15 @@ Stop the infrastructure with `npm run infra:down` (add `-v` to `docker compose d
 
 ## Scripts
 
-| Command                | What it does                                                |
-| ---------------------- | ----------------------------------------------------------- |
-| `npm run infra:up`     | Start Postgres, Redis and the simulator                     |
-| `npm run db:migrate`   | Apply all migrations                                        |
-| `npm run dev:server`   | Run the API with reload                                     |
-| `npm test`             | Unit + Postgres tests (in-process PGlite, no Docker needed) |
-| `npm run typecheck`    | TypeScript checks for every workspace                       |
-| `npm run lint`         | ESLint                                                      |
-| `npm run format:check` | Prettier                                                    |
+| Command                | What it does                                                                                                                                                  |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `npm run infra:up`     | Start Postgres, Redis and the simulator                                                                                                                       |
+| `npm run db:migrate`   | Apply all migrations                                                                                                                                          |
+| `npm run dev:server`   | Run the API with reload                                                                                                                                       |
+| `npm test`             | Unit + Postgres tests (in-process PGlite, no Docker needed); the Redis limiter test also runs when Redis is reachable on `localhost:6379` or `TEST_REDIS_URL` |
+| `npm run typecheck`    | TypeScript checks for every workspace                                                                                                                         |
+| `npm run lint`         | ESLint                                                                                                                                                        |
+| `npm run format:check` | Prettier                                                                                                                                                      |
 
 ## API
 
@@ -139,9 +139,33 @@ Each worker loop (8 by default, inside the API process) repeats:
 5. **Close the job** when no task is pending or in flight, using a conditional update so two workers
    finishing together can't both close it.
 
+Two background safeguards run alongside the workers:
+
+- **Lease reaper** (on startup and every 5 s): a task still `IN_FLIGHT` after its 30 s lease belongs to
+  a worker that stopped responding (crash, restart, hung process). It goes back to `PENDING`, or to
+  `FAILED` if that was its last attempt. If the lost worker's answer arrives later, the lease-token
+  guard discards it.
+- **Circuit breaker:** if the API returns nothing but 5xx, timeouts, network errors or bad bodies for
+  30 s straight (and at least 10 of them), the run is systemically broken. The job becomes
+  `FAILED_SYSTEMIC` with the reason, and every unfinished task becomes `ABORTED`, in one transaction.
+  Any success resets the count, so the simulator's normal ~12% noise and short outages never trip it.
+  429s and other 4xx are ignored: they describe our requests, not the API's health.
+
+**Retries wait behind fresh work.** The queue hands out the task that has been due longest. Fresh tasks
+became due when the job started, so a task scheduled for a retry runs after the fresh work ahead of it.
+New stores keep flowing and retries get natural extra spacing; the tail of a job is mostly retries.
+
 Every attempt is recorded in `enrichment_attempts` (outcome, HTTP status, latency, error).
 
-**Measured against the simulator** (300 stores): finished in 90 s, all succeeded, zero 429s,
-33 transient 500s and 5 hangs all retried successfully, at most 3 attempts for any store.
+### Measured against the simulator
+
+| Scenario                                                             | Result                                                                                                      |
+| -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| 5,000 stores, normal run                                             | 24 min; 4,999 succeeded, 1 failed after 5 attempts (four 500s and a timeout); zero 429s                     |
+| 300 stores                                                           | 90 s; all succeeded; 33 transient 500s and 5 hangs retried; zero 429s                                       |
+| Worker killed with `kill -9` mid-job, new worker started             | In-flight task reclaimed; 100/100 succeeded; one metrics row per store                                      |
+| Simulator down for 12 s mid-job                                      | Progress paused, then resumed; no store failed                                                              |
+| Simulator down for good                                              | Breaker tripped after 30 s (123 failures in a row); job `FAILED_SYSTEMIC`, 304 tasks `ABORTED`              |
+| Two worker processes with separate in-process limiters (by accident) | ~8 calls/s, so 429s; still no duplicates and all succeeded. This is why the real limiter is shared in Redis |
 
 Full design notes, trade-offs and known limitations will be completed as the phases land.

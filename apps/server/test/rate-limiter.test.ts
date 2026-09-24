@@ -51,9 +51,39 @@ describe('in-memory rate limiter', () => {
   });
 });
 
-// Runs only when a Redis is available, e.g. `TEST_REDIS_URL=redis://localhost:6379 npm test`.
-const redisUrl = process.env.TEST_REDIS_URL;
-describe.skipIf(!redisUrl)('redis rate limiter', () => {
+/**
+ * Uses a real Redis when one is reachable: TEST_REDIS_URL, else redis://localhost:6379.
+ * Skipped (not failed) when none is running, so `npm test` works on any machine.
+ * Set TEST_REDIS_URL=off to skip it explicitly.
+ */
+async function findRedis(): Promise<string | undefined> {
+  const url = process.env.TEST_REDIS_URL ?? 'redis://localhost:6379';
+  if (url === 'off') return undefined;
+  const probe = new Redis(url, {
+    lazyConnect: true,
+    connectTimeout: 500,
+    maxRetriesPerRequest: 0,
+    retryStrategy: () => null,
+    enableOfflineQueue: false,
+  });
+  probe.on('error', () => undefined); // a refused connection is an answer, not a test failure
+  try {
+    await probe.connect();
+    await probe.ping();
+    return url;
+  } catch {
+    return undefined;
+  } finally {
+    probe.disconnect();
+  }
+}
+
+const redisUrl = await findRedis();
+const redisLabel = redisUrl
+  ? `redis rate limiter (${redisUrl})`
+  : 'redis rate limiter (skipped: no Redis reachable; start one or set TEST_REDIS_URL)';
+
+describe.skipIf(!redisUrl)(redisLabel, () => {
   it('spaces callers evenly across separate clients (like separate processes)', async () => {
     const key = `tierforge:test:${Date.now()}`;
     const a = new Redis(redisUrl!);

@@ -1,6 +1,7 @@
 import { buildApp } from './app.js';
 import { loadConfig } from './config.js';
 import { createDb } from './db/database.js';
+import { CircuitBreaker } from './enrichment/circuit-breaker.js';
 import { createHttpEnrichmentClient } from './enrichment/enrichment-client.js';
 import { createRedisRateLimiter } from './enrichment/rate-limiter.js';
 import { createTaskQueue } from './enrichment/task-queue.js';
@@ -31,6 +32,10 @@ async function main(): Promise<void> {
             timeoutMs: config.REQUEST_TIMEOUT_MS,
           }),
           limiter: createRedisRateLimiter(redis, config.RATE_LIMIT_PER_SECOND),
+          breaker: new CircuitBreaker({
+            windowMs: config.BREAKER_WINDOW_MS,
+            minFailures: config.BREAKER_MIN_FAILURES,
+          }),
           logger: app.log,
         },
         {
@@ -39,6 +44,7 @@ async function main(): Promise<void> {
           idlePollMs: config.WORKER_IDLE_POLL_MS,
           rateLimitPauseMs: config.RATE_LIMIT_PAUSE_MS,
           errorBackoffMs: 2_000,
+          reaperIntervalMs: config.REAPER_INTERVAL_MS,
           maxAttempts: config.MAX_ATTEMPTS,
           baseDelayMs: config.BACKOFF_BASE_MS,
           maxDelayMs: config.BACKOFF_MAX_MS,

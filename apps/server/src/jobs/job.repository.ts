@@ -210,3 +210,40 @@ export async function finalizeFinishedJobs(db: DB): Promise<number> {
   `.execute(db);
   return Number(result.numAffectedRows ?? 0);
 }
+
+/**
+ * Terminal stop for a systemically broken run: every RUNNING job becomes FAILED_SYSTEMIC
+ * and its unfinished tasks (PENDING or IN_FLIGHT) become ABORTED, in one transaction.
+ * Clearing the leases means any answer still on its way is discarded as stale:
+ * a terminal job stays terminal.
+ */
+export async function failRunningJobsSystemically(db: DB, reason: string): Promise<string[]> {
+  return db.transaction().execute(async (trx) => {
+    const jobs = await trx
+      .updateTable('enrichment_jobs')
+      .set({
+        status: 'FAILED_SYSTEMIC',
+        terminal_reason: reason,
+        finished_at: sql`now()`,
+      })
+      .where('status', '=', 'RUNNING')
+      .returning('id')
+      .execute();
+    const ids = jobs.map((j) => j.id);
+    if (ids.length) {
+      await trx
+        .updateTable('enrichment_tasks')
+        .set({
+          status: 'ABORTED',
+          lease_token: null,
+          lease_expires_at: null,
+          last_error: `aborted: ${reason}`,
+          updated_at: sql`now()`,
+        })
+        .where('job_id', 'in', ids)
+        .where('status', 'in', ['PENDING', 'IN_FLIGHT'])
+        .execute();
+    }
+    return ids;
+  });
+}

@@ -1,20 +1,22 @@
 import pino from 'pino';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { DB } from '../src/db/database.js';
+import { CircuitBreaker } from '../src/enrichment/circuit-breaker.js';
 import type { EnrichmentClient } from '../src/enrichment/enrichment-client.js';
 import {
   createInMemoryRateLimiter,
   RateLimiterUnavailableError,
+  type RateLimiter,
 } from '../src/enrichment/rate-limiter.js';
 import { createTaskQueue } from '../src/enrichment/task-queue.js';
 import type { EnrichmentOutcome } from '../src/enrichment/types.js';
-import { WorkerPool } from '../src/enrichment/worker-pool.js';
+import { WorkerPool, type WorkerPoolOptions } from '../src/enrichment/worker-pool.js';
 import { createJobRepository, type JobView } from '../src/jobs/job.repository.js';
 import { createTestDb } from './test-db.js';
 import { resetJobs, seedUpload } from './seed.js';
 
 const logger = pino({ level: 'silent' });
-const options = {
+const baseOptions: WorkerPoolOptions = {
   concurrency: 4,
   leaseMs: 30_000,
   idlePollMs: 5,
@@ -23,6 +25,7 @@ const options = {
   maxAttempts: 3,
   baseDelayMs: 1,
   maxDelayMs: 4,
+  reaperIntervalMs: 20,
 };
 const success = (n: number): EnrichmentOutcome => ({
   kind: 'success',
@@ -57,23 +60,20 @@ describe('worker pool (Postgres)', () => {
   afterAll(() => db.destroy());
   beforeEach(() => resetJobs(db));
 
-  const pool = (client: EnrichmentClient, random = () => 0.5) =>
+  const pool = (
+    client: EnrichmentClient,
+    overrides: Partial<WorkerPoolOptions> = {},
+    limiter: RateLimiter = createInMemoryRateLimiter(1_000),
+    breaker = new CircuitBreaker({ windowMs: 60_000, minFailures: 1_000 }),
+  ) =>
     new WorkerPool(
-      {
-        db,
-        queue: createTaskQueue(db),
-        client,
-        limiter: createInMemoryRateLimiter(1_000),
-        logger,
-        random,
-      },
-      options,
+      { db, queue: createTaskQueue(db), client, limiter, breaker, logger, random: () => 0.5 },
+      { ...baseOptions, ...overrides },
     );
 
   it('enriches every store through transient failures without duplicates', async () => {
     const job = await createJobRepository(db).start(uploadId);
     const calls = new Map<string, number>();
-    // Each store fails with a different transient error on its first call, then succeeds.
     const failures: EnrichmentOutcome[] = [
       { kind: 'server_error', httpStatus: 500, message: 'boom' },
       { kind: 'rate_limited', httpStatus: 429 },
@@ -126,69 +126,77 @@ describe('worker pool (Postgres)', () => {
     ]);
   });
 
-  it('keeps running when a dependency throws, instead of killing the loop', async () => {
+  it('recovers work from a worker that dies mid-call (lease reclaimed and retried)', async () => {
     const job = await createJobRepository(db).start(uploadId);
     let thrown = 0;
     const client: EnrichmentClient = {
       async enrich(store) {
         if (thrown < 3) {
           thrown++;
-          throw new Error('unexpected bug');
+          throw new Error('worker crashed mid-call'); // task stays IN_FLIGHT, nobody records it
         }
         return success(Number(store.store_id.slice(2)));
       },
     };
-    // A thrown error leaves the task IN_FLIGHT until its lease expires (Phase 3 reaper);
-    // here we only check the loops survive and the rest of the job proceeds.
-    const p = pool(client);
-    p.start();
-    await new Promise((r) => setTimeout(r, 500));
-    await p.stop();
-    const progress = await createJobRepository(db).progress(job.id);
+
+    const finished = await runUntilDone(db, pool(client, { leaseMs: 200 }), job.id);
+
     expect(thrown).toBe(3);
-    expect(progress.succeeded).toBe(37);
-    expect(progress.inFlight).toBe(3);
+    expect(finished.status).toBe('COMPLETED');
+    expect(await createJobRepository(db).progress(job.id)).toMatchObject({ succeeded: 40 });
   });
-});
 
-describe('worker pool when the rate limiter is down', () => {
-  let db: DB;
-  let uploadId: string;
-
-  beforeAll(async () => {
-    db = await createTestDb();
-    uploadId = await seedUpload(db, 5);
-  });
-  afterAll(() => db.destroy());
-
-  it('never calls the API and never claims a task while it cannot get a slot', async () => {
+  it('stops a systemically broken run with a clear terminal state', async () => {
     const job = await createJobRepository(db).start(uploadId);
     let calls = 0;
-    const pool = new WorkerPool(
-      {
-        db,
-        queue: createTaskQueue(db),
-        client: {
-          async enrich() {
-            calls++;
-            return success(1);
-          },
-        },
-        limiter: {
-          acquire: () => Promise.reject(new RateLimiterUnavailableError(new Error('ECONNREFUSED'))),
-          pause: () => Promise.resolve(),
-        },
-        logger,
+    const client: EnrichmentClient = {
+      async enrich() {
+        calls++;
+        return { kind: 'network_error', message: 'connect ECONNREFUSED 127.0.0.1:8000' };
       },
-      options,
+    };
+    const breaker = new CircuitBreaker({ windowMs: 150, minFailures: 5 });
+
+    const finished = await runUntilDone(
+      db,
+      pool(client, { maxAttempts: 1_000 }, createInMemoryRateLimiter(1_000), breaker),
+      job.id,
     );
-    pool.start();
+
+    expect(finished.status).toBe('FAILED_SYSTEMIC');
+    expect(finished.terminalReason).toContain('last error: network error: connect ECONNREFUSED');
+    const progress = await createJobRepository(db).progress(job.id);
+    expect(progress.succeeded).toBe(0);
+    expect(progress.pending + progress.inFlight).toBe(0);
+    expect(progress.aborted + progress.failed).toBe(40);
+    const callsAtStop = calls;
     await new Promise((r) => setTimeout(r, 100));
-    await pool.stop();
+    expect(calls).toBe(callsAtStop); // nothing keeps hammering the API
+  });
+
+  it('never calls the API or claims a task while the rate limiter is down', async () => {
+    const job = await createJobRepository(db).start(uploadId);
+    let calls = 0;
+    const p = pool(
+      {
+        async enrich() {
+          calls++;
+          return success(1);
+        },
+      },
+      {},
+      {
+        acquire: () => Promise.reject(new RateLimiterUnavailableError(new Error('ECONNREFUSED'))),
+        pause: () => Promise.resolve(),
+      },
+    );
+    p.start();
+    await new Promise((r) => setTimeout(r, 100));
+    await p.stop();
 
     expect(calls).toBe(0);
     expect(await createJobRepository(db).progress(job.id)).toMatchObject({
-      pending: 5,
+      pending: 40,
       inFlight: 0,
     });
   });

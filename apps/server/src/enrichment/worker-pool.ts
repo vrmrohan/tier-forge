@@ -1,8 +1,10 @@
 import type { FastifyBaseLogger } from 'fastify';
 import type { DB } from '../db/database.js';
-import { finalizeFinishedJobs } from '../jobs/job.repository.js';
+import { failRunningJobsSystemically, finalizeFinishedJobs } from '../jobs/job.repository.js';
 import { sleep } from '../lib/sleep.js';
+import type { CircuitBreaker } from './circuit-breaker.js';
 import type { EnrichmentClient } from './enrichment-client.js';
+import { reapExpiredLeases } from './lease-reaper.js';
 import { RateLimiterUnavailableError, type RateLimiter } from './rate-limiter.js';
 import {
   attemptOutcomeOf,
@@ -21,6 +23,8 @@ export interface WorkerPoolOptions extends RetryPolicyOptions {
   rateLimitPauseMs: number;
   /** Back-off after an unexpected error (DB or Redis down, bug) so a loop never spins. */
   errorBackoffMs: number;
+  /** How often to look for expired leases (also done once at start). */
+  reaperIntervalMs: number;
 }
 
 export interface WorkerPoolDeps {
@@ -28,6 +32,7 @@ export interface WorkerPoolDeps {
   queue: TaskQueue;
   client: EnrichmentClient;
   limiter: RateLimiter;
+  breaker: CircuitBreaker;
   logger: FastifyBaseLogger;
   random?: () => number;
 }
@@ -49,7 +54,10 @@ export class WorkerPool {
 
   start(): void {
     if (this.loops.length) return;
-    this.loops = Array.from({ length: this.options.concurrency }, (_, i) => this.runLoop(i));
+    this.loops = [
+      this.runReaper(),
+      ...Array.from({ length: this.options.concurrency }, (_, i) => this.runLoop(i)),
+    ];
     this.deps.logger.info({ concurrency: this.options.concurrency }, 'enrichment workers started');
   }
 
@@ -74,6 +82,31 @@ export class WorkerPool {
     }
     await this.process(task);
     return true;
+  }
+
+  /**
+   * Reclaims tasks from workers that stopped responding. Runs immediately on start,
+   * so work stranded by a crash or restart is picked up again, then on an interval.
+   */
+  async reapOnce(): Promise<void> {
+    const { db, logger } = this.deps;
+    const result = await reapExpiredLeases(db, this.options.maxAttempts);
+    if (result.requeued || result.failed) {
+      logger.warn(result, 'reclaimed tasks with expired leases');
+    }
+    if (result.failed) await finalizeFinishedJobs(db);
+  }
+
+  private async runReaper(): Promise<void> {
+    const signal = this.controller.signal;
+    while (!signal.aborted) {
+      try {
+        await this.reapOnce();
+      } catch (error) {
+        this.deps.logger.error({ err: error }, 'lease reaper error');
+      }
+      await sleep(this.options.reaperIntervalMs, signal);
+    }
   }
 
   private async runLoop(workerId: number): Promise<void> {
@@ -112,6 +145,7 @@ export class WorkerPool {
     const latencyMs = Math.round(performance.now() - startedAt);
 
     if (outcome.kind === 'success') {
+      this.deps.breaker.record(outcome);
       const result = await queue.recordSuccess(task, outcome.metrics, latencyMs);
       if (result === 'stale') log.warn('late success ignored: lease was reclaimed');
       else await finalizeFinishedJobs(this.deps.db);
@@ -134,6 +168,13 @@ export class WorkerPool {
       },
       decision,
     );
+
+    const verdict = this.deps.breaker.record(outcome, error);
+    if (verdict.tripped) {
+      const jobIds = await failRunningJobsSystemically(this.deps.db, verdict.reason);
+      logger.error({ jobIds, reason: verdict.reason }, 'circuit breaker tripped: job stopped');
+      return;
+    }
 
     if (result === 'stale') {
       log.warn({ error }, 'late failure ignored: lease was reclaimed');

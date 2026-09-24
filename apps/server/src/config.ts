@@ -30,6 +30,9 @@ const ConfigSchema = z.object({
   WORKER_IDLE_POLL_MS: z.coerce.number().int().positive().default(500),
   RATE_LIMIT_PAUSE_MS: z.coerce.number().int().nonnegative().default(1_000),
   BREAKER_WINDOW_MS: z.coerce.number().int().positive().default(30_000),
+  /** ...and at least this many failures in that streak. */
+  BREAKER_MIN_FAILURES: z.coerce.number().int().min(1).default(10),
+  REAPER_INTERVAL_MS: z.coerce.number().int().positive().default(5_000),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
