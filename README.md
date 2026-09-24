@@ -4,7 +4,7 @@ Resilient bulk store scoring and tiering. TierForge ingests a CSV of stores, enr
 rate-limited and flaky Enrichment API, then scores and tiers every store (Large / Medium / Small) from
 user-configured bars and weights.
 
-> Status: Phase 0 (scaffold, infrastructure, database schema). Features land phase by phase.
+> Status: Phase 1 done (CSV upload). Features land phase by phase.
 
 ## Prerequisites
 
@@ -43,14 +43,40 @@ Stop the infrastructure with `npm run infra:down` (add `-v` to `docker compose d
 
 ## Scripts
 
-| Command                | What it does                            |
-| ---------------------- | --------------------------------------- |
-| `npm run infra:up`     | Start Postgres, Redis and the simulator |
-| `npm run db:migrate`   | Apply all migrations                    |
-| `npm run dev:server`   | Run the API with reload                 |
-| `npm run typecheck`    | TypeScript checks for every workspace   |
-| `npm run lint`         | ESLint                                  |
-| `npm run format:check` | Prettier                                |
+| Command                | What it does                                                |
+| ---------------------- | ----------------------------------------------------------- |
+| `npm run infra:up`     | Start Postgres, Redis and the simulator                     |
+| `npm run db:migrate`   | Apply all migrations                                        |
+| `npm run dev:server`   | Run the API with reload                                     |
+| `npm test`             | Unit + Postgres tests (in-process PGlite, no Docker needed) |
+| `npm run typecheck`    | TypeScript checks for every workspace                       |
+| `npm run lint`         | ESLint                                                      |
+| `npm run format:check` | Prettier                                                    |
+
+## API
+
+### `POST /uploads`
+
+Multipart form with the CSV in a `file` field. The sample file is in `data/stores_5000.csv`.
+
+```bash
+curl -F file=@data/stores_5000.csv localhost:3000/uploads
+```
+
+- **Header check first.** Column names are matched after stripping a BOM, trimming and lowercasing, in
+  any order. Missing, unexpected or duplicated columns reject the whole file with `400 INVALID_CSV_HEADER`
+  naming each problem; nothing is stored.
+- **Row checks.** Rows with the wrong column count, an empty value, a value over 500 characters, or a
+  repeated `store_id` (first one wins) are skipped and reported with their line number.
+- Valid rows are saved in one transaction. The response (`201`) has `acceptedRows`, `rejectedRows` and up
+  to 100 row `errors`. A file with no valid rows returns `400 NO_VALID_ROWS`.
+- Limits: 20 MB per file, 100,000 rows.
+
+### `GET /uploads/:id`
+
+Returns the upload's id, filename, row count and creation time.
+
+All errors share one shape: `{ "error": { "code", "message", "details"? } }`.
 
 ## Architecture (summary)
 

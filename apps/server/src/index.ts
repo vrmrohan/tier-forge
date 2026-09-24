@@ -2,12 +2,13 @@ import { buildApp } from './app.js';
 import { loadConfig } from './config.js';
 import { createDb } from './db/database.js';
 import { createRedis } from './redis.js';
+import { createUploadRepository } from './uploads/upload.repository.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
   const db = createDb(config.DATABASE_URL);
   const redis = createRedis(config.REDIS_URL);
-  const app = buildApp({ config, db, redis });
+  const app = buildApp({ config, db, redis, uploads: createUploadRepository(db) });
 
   const shutdown = async (signal: string): Promise<void> => {
     app.log.info({ signal }, 'shutting down');
