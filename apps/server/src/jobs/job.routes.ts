@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { badRequest, notFound } from '../http/errors.js';
+import { notFound } from '../http/errors.js';
+import { parseInput as parse } from '../http/validation.js';
 import type { JobRepository } from './job.repository.js';
 
 const StartJobBody = z.object({ uploadId: z.string().uuid() });
@@ -9,14 +10,6 @@ const Page = z.object({
   limit: z.coerce.number().int().min(1).max(500).default(50),
   offset: z.coerce.number().int().min(0).default(0),
 });
-
-function parse<T>(schema: z.ZodType<T>, value: unknown, what: string): T {
-  const result = schema.safeParse(value);
-  if (!result.success) {
-    throw badRequest('INVALID_REQUEST', `Invalid ${what}`, z.flattenError(result.error));
-  }
-  return result.data;
-}
 
 export function registerJobRoutes(app: FastifyInstance, jobs: JobRepository): void {
   /** Starts enriching every store of an upload. 409 if a job is already running. */

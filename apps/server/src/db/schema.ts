@@ -28,8 +28,9 @@ export const ATTEMPT_OUTCOMES = [
 ] as const;
 export type AttemptOutcome = (typeof ATTEMPT_OUTCOMES)[number];
 
-export const TIERS = ['LARGE', 'MEDIUM', 'SMALL'] as const;
-export type Tier = (typeof TIERS)[number];
+// Tiers come from the shared scoring rules so the DB, API and web app use one list.
+import { TIERS, type Tier } from '@tierforge/shared';
+export { TIERS, type Tier };
 
 type Timestamp = ColumnType<Date, Date | string | undefined, Date | string>;
 type NullableTimestamp = ColumnType<

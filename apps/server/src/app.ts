@@ -7,6 +7,8 @@ import type { DB } from './db/database.js';
 import { registerErrorHandler } from './http/errors.js';
 import type { JobRepository } from './jobs/job.repository.js';
 import { registerJobRoutes } from './jobs/job.routes.js';
+import type { ScoringRepository } from './scoring/scoring.repository.js';
+import { registerScoringRoutes } from './scoring/scoring.routes.js';
 import type { UploadRepository } from './uploads/upload.repository.js';
 import { registerUploadRoutes } from './uploads/upload.routes.js';
 
@@ -19,6 +21,7 @@ export interface AppDeps {
   redis: Redis;
   uploads: UploadRepository;
   jobs: JobRepository;
+  scoring: ScoringRepository;
 }
 
 type CheckResult = 'ok' | 'down';
@@ -32,7 +35,7 @@ async function check(probe: () => Promise<unknown>): Promise<CheckResult> {
   }
 }
 
-export function buildApp({ config, db, redis, uploads, jobs }: AppDeps): FastifyInstance {
+export function buildApp({ config, db, redis, uploads, jobs, scoring }: AppDeps): FastifyInstance {
   const app = Fastify({ logger: { level: config.LOG_LEVEL } });
 
   registerErrorHandler(app);
@@ -58,6 +61,7 @@ export function buildApp({ config, db, redis, uploads, jobs }: AppDeps): Fastify
 
   registerUploadRoutes(app, uploads);
   registerJobRoutes(app, jobs);
+  registerScoringRoutes(app, jobs, scoring);
 
   return app;
 }

@@ -186,6 +186,7 @@ describe('worker pool (Postgres)', () => {
       },
       {},
       {
+        reserve: () => Promise.reject(new RateLimiterUnavailableError(new Error('ECONNREFUSED'))),
         acquire: () => Promise.reject(new RateLimiterUnavailableError(new Error('ECONNREFUSED'))),
         pause: () => Promise.resolve(),
       },

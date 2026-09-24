@@ -22,3 +22,41 @@ export async function seedUpload(db: DB, count: number): Promise<string> {
 export async function resetJobs(db: DB): Promise<void> {
   await db.deleteFrom('enrichment_jobs').execute();
 }
+
+/**
+ * Creates a job whose stores are already enriched with the given metrics
+ * (bypassing the worker), for scoring tests.
+ */
+export async function seedEnrichedJob(
+  db: DB,
+  metrics: { footfall: number; revenue: number; sizeSqft: number }[],
+  status: 'RUNNING' | 'COMPLETED' = 'COMPLETED',
+): Promise<string> {
+  const uploadId = await seedUpload(db, metrics.length);
+  const job = await db
+    .insertInto('enrichment_jobs')
+    .values({ upload_id: uploadId, status, total: metrics.length, started_at: new Date() })
+    .returning('id')
+    .executeTakeFirstOrThrow();
+  const stores = await db
+    .selectFrom('stores')
+    .select('id')
+    .where('upload_id', '=', uploadId)
+    .orderBy('store_id')
+    .execute();
+  for (let i = 0; i < metrics.length; i += 1_000) {
+    await db
+      .insertInto('store_metrics')
+      .values(
+        metrics.slice(i, i + 1_000).map((m, j) => ({
+          store_pk: stores[i + j]!.id,
+          job_id: job.id,
+          footfall: m.footfall,
+          revenue: m.revenue,
+          size_sqft: m.sizeSqft,
+        })),
+      )
+      .execute();
+  }
+  return job.id;
+}

@@ -4,7 +4,7 @@ Resilient bulk store scoring and tiering. TierForge ingests a CSV of stores, enr
 rate-limited and flaky Enrichment API, then scores and tiers every store (Large / Medium / Small) from
 user-configured bars and weights.
 
-> Status: Phase 3 done (CSV upload, enrichment job engine with full failure handling). Features land phase by phase.
+> Status: Phase 4 done (CSV upload, resilient enrichment, scoring and tiering). Next: web dashboard. Features land phase by phase.
 
 ## Prerequisites
 
@@ -33,13 +33,14 @@ Stop the infrastructure with `npm run infra:down` (add `-v` to `docker compose d
 
 ## Repository layout
 
-| Path                            | Purpose                                                  |
-| ------------------------------- | -------------------------------------------------------- |
-| `apps/server`                   | Fastify API and enrichment workers (Node + TypeScript)   |
-| `apps/server/src/db/migrations` | Kysely migrations; the schema's source of truth          |
-| `apps/server/src/db/schema.ts`  | Table types used by Kysely, kept in sync with migrations |
-| `apps/web` _(Phase 5)_          | React + Vite dashboard                                   |
-| `docker-compose.yml`            | Postgres 16, Redis 7 and the simulator                   |
+| Path                            | Purpose                                                       |
+| ------------------------------- | ------------------------------------------------------------- |
+| `apps/server`                   | Fastify API and enrichment workers (Node + TypeScript)        |
+| `apps/server/src/db/migrations` | Kysely migrations; the schema's source of truth               |
+| `packages/shared`               | Scoring rules and config validation shared by API and web app |
+| `apps/server/src/db/schema.ts`  | Table types used by Kysely, kept in sync with migrations      |
+| `apps/web` _(Phase 5)_          | React + Vite dashboard                                        |
+| `docker-compose.yml`            | Postgres 16, Redis 7 and the simulator                        |
 
 ## Scripts
 
@@ -97,6 +98,36 @@ Stores that ultimately failed, each with attempts, the last HTTP status and the 
 ### `GET /jobs`
 
 The 20 most recent jobs.
+
+### `POST /jobs/:id/scoring-runs`
+
+Scores and tiers every enriched store. Reads stored metrics only (never calls the Enrichment API),
+runs as one SQL statement, and can be repeated whenever the settings change.
+
+```json
+{
+  "bars": { "footfall": 15000, "revenue": 150000, "sizeSqft": 8000 },
+  "weights": { "footfall": 50, "revenue": 30, "sizeSqft": 20 },
+  "tiers": { "large": 70, "medium": 40 }
+}
+```
+
+- **Score** = sum of the weights of the bars a store clears (value ≥ bar), so 0–100.
+- **Tier** = `LARGE` if score ≥ `large`, `MEDIUM` if score ≥ `medium`, else `SMALL`.
+- Weights are whole numbers adding up to exactly 100; `medium` must be below `large`. Invalid input
+  returns `400` listing every problem, e.g. `weights must add up to 100 (currently 90)`.
+- Returns the run with its tier counts. Allowed while enrichment is still running; `partial: true`
+  then says later-enriched stores aren't included.
+- Each run keeps its own settings and results, so earlier breakdowns stay reproducible.
+
+### `GET /jobs/:id/scoring-runs/latest` and `GET /jobs/:id/scoring-runs/:runId`
+
+A run's settings, number of stores scored and tier counts.
+
+### `GET /jobs/:id/stores?tier=LARGE&sort=score&order=desc&limit=50&offset=0`
+
+Enriched stores with name, city, footfall, revenue, size, score and tier, from the latest run (or
+`run=<id>`). Filter by `tier`; sort by `score`, `storeId`, `footfall`, `revenue` or `sizeSqft`.
 
 All errors share one shape: `{ "error": { "code", "message", "details"? } }`.
 
@@ -167,5 +198,13 @@ Every attempt is recorded in `enrichment_attempts` (outcome, HTTP status, latenc
 | Simulator down for 12 s mid-job                                      | Progress paused, then resumed; no store failed                                                              |
 | Simulator down for good                                              | Breaker tripped after 30 s (123 failures in a row); job `FAILED_SYSTEMIC`, 304 tasks `ABORTED`              |
 | Two worker processes with separate in-process limiters (by accident) | ~8 calls/s, so 429s; still no duplicates and all succeeded. This is why the real limiter is shared in Redis |
+
+### Scoring
+
+Scoring is deliberately separate from enrichment: it reads only `store_metrics` and writes only
+`scoring_configs` + `store_scores`. The rule exists twice on purpose: as one set-based SQL statement
+(fast: 5,000 stores well under a second) and as a pure TypeScript function in `@tierforge/shared`
+(used by tests and the web app). A test scores 1,000 random stores, including values exactly on and
+one unit below each bar, both ways and requires identical results.
 
 Full design notes, trade-offs and known limitations will be completed as the phases land.

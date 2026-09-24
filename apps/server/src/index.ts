@@ -8,6 +8,7 @@ import { createTaskQueue } from './enrichment/task-queue.js';
 import { WorkerPool } from './enrichment/worker-pool.js';
 import { createJobRepository } from './jobs/job.repository.js';
 import { createRedis, waitForRedis } from './redis.js';
+import { createScoringRepository } from './scoring/scoring.repository.js';
 import { createUploadRepository } from './uploads/upload.repository.js';
 
 async function main(): Promise<void> {
@@ -20,6 +21,7 @@ async function main(): Promise<void> {
     redis,
     uploads: createUploadRepository(db),
     jobs: createJobRepository(db),
+    scoring: createScoringRepository(db),
   });
 
   const workers = config.RUN_WORKERS

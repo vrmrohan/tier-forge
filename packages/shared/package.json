@@ -1,0 +1,21 @@
+{
+  "name": "@tierforge/shared",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Scoring rules and types shared by the API and the web app",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "typescript": "~6.0.3",
+    "vitest": "^5.0.1"
+  }
+}

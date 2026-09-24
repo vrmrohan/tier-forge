@@ -29,25 +29,44 @@ describe('reserveSlot', () => {
   });
 });
 
-/** At 20/s, 6 acquisitions must take at least 5 intervals (250 ms). */
-async function expectEvenSpacing(limiter: RateLimiter): Promise<void> {
+/**
+ * The limiter's guarantee is the schedule it hands out: every caller gets its own slot,
+ * exactly one interval apart, with no two in the same window. Checking the reserved slots
+ * (not when JS timers happen to fire) keeps this exact even on a busy machine, where an
+ * event-loop stall can fire two timers in the same tick.
+ */
+async function expectEvenlySpacedSlots(limiter: RateLimiter, intervalMs: number): Promise<void> {
+  const slots = await Promise.all(Array.from({ length: 6 }, () => limiter.reserve()));
+  const times = slots.map((s) => s.slotMs).sort((a, b) => a - b);
+  expect(new Set(times).size).toBe(6);
+  for (let i = 1; i < times.length; i++) expect(times[i]! - times[i - 1]!).toBe(intervalMs);
+}
+
+/** acquire() really waits: 6 calls at 20/s can't all finish before 5 intervals have passed. */
+async function expectAcquireWaits(limiter: RateLimiter): Promise<void> {
   const start = performance.now();
-  const times: number[] = [];
-  await Promise.all(
-    Array.from({ length: 6 }, async () => {
-      await limiter.acquire();
-      times.push(performance.now() - start);
-    }),
-  );
-  times.sort((a, b) => a - b);
-  expect(times.at(-1)!).toBeGreaterThanOrEqual(240);
-  // No two calls closer than ~one interval (small tolerance for timer jitter).
-  for (let i = 1; i < times.length; i++) expect(times[i]! - times[i - 1]!).toBeGreaterThan(35);
+  await Promise.all(Array.from({ length: 6 }, () => limiter.acquire()));
+  // Lower bound only: a busy machine can make this slower, never faster.
+  expect(performance.now() - start).toBeGreaterThanOrEqual(240);
 }
 
 describe('in-memory rate limiter', () => {
-  it('spaces concurrent callers evenly', async () => {
-    await expectEvenSpacing(createInMemoryRateLimiter(20));
+  it('hands concurrent callers slots exactly one interval apart', async () => {
+    await expectEvenlySpacedSlots(createInMemoryRateLimiter(20), 50);
+  });
+
+  it('makes callers wait for their slot', async () => {
+    await expectAcquireWaits(createInMemoryRateLimiter(20));
+  });
+
+  it('pushes every later slot out after a pause', async () => {
+    let now = 1_000;
+    const limiter = createInMemoryRateLimiter(4, () => now);
+    expect((await limiter.reserve()).slotMs).toBe(1_000);
+    await limiter.pause(2_000);
+    expect((await limiter.reserve()).slotMs).toBe(3_000);
+    now = 10_000;
+    expect((await limiter.reserve()).slotMs).toBe(10_000);
   });
 });
 
@@ -84,19 +103,24 @@ const redisLabel = redisUrl
   : 'redis rate limiter (skipped: no Redis reachable; start one or set TEST_REDIS_URL)';
 
 describe.skipIf(!redisUrl)(redisLabel, () => {
-  it('spaces callers evenly across separate clients (like separate processes)', async () => {
-    const key = `tierforge:test:${Date.now()}`;
+  it('hands slots one interval apart across separate clients (like separate processes)', async () => {
+    const key = `tierforge:test:${Date.now()}:${Math.random()}`;
     const a = new Redis(redisUrl!);
     const b = new Redis(redisUrl!);
     const limiterA = createRedisRateLimiter(a, 20, key);
     const limiterB = createRedisRateLimiter(b, 20, key);
+    let turn = 0;
     const shared: RateLimiter = {
-      acquire: (s) => (Math.random() < 0.5 ? limiterA : limiterB).acquire(s),
+      reserve: () => (turn++ % 2 ? limiterA : limiterB).reserve(),
+      acquire: (s) => (turn++ % 2 ? limiterA : limiterB).acquire(s),
       pause: (ms) => limiterA.pause(ms),
     };
     try {
-      await expectEvenSpacing(shared);
+      await expectEvenlySpacedSlots(shared, 50);
+      await a.del(key);
+      await expectAcquireWaits(shared);
     } finally {
+      await a.del(key);
       await Promise.all([a.quit(), b.quit()]);
     }
   });
