@@ -4,7 +4,7 @@ Resilient bulk store scoring and tiering. TierForge ingests a CSV of stores, enr
 rate-limited and flaky Enrichment API, then scores and tiers every store (Large / Medium / Small) from
 user-configured bars and weights.
 
-> Status: Phase 1 done (CSV upload). Features land phase by phase.
+> Status: Phase 2 done (CSV upload, enrichment job engine). Features land phase by phase.
 
 ## Prerequisites
 
@@ -76,6 +76,28 @@ curl -F file=@data/stores_5000.csv localhost:3000/uploads
 
 Returns the upload's id, filename, row count and creation time.
 
+### `POST /jobs`
+
+Body `{ "uploadId": "<uuid>" }`. Creates a job with one task per store and starts enriching in the
+background. Returns `409 JOB_ALREADY_RUNNING` if another job is still active.
+
+```bash
+curl -X POST localhost:3000/jobs -H 'content-type: application/json' -d '{"uploadId":"<id>"}'
+```
+
+### `GET /jobs/:id`
+
+Job status (`RUNNING`, `COMPLETED`, `COMPLETED_WITH_FAILURES`, `FAILED_SYSTEMIC`) and live counts:
+`total`, `pending`, `inFlight`, `succeeded`, `failed`, `aborted`, plus `lastProgressAt`.
+
+### `GET /jobs/:id/failures?limit=50&offset=0`
+
+Stores that ultimately failed, each with attempts, the last HTTP status and the reason.
+
+### `GET /jobs`
+
+The 20 most recent jobs.
+
 All errors share one shape: `{ "error": { "code", "message", "details"? } }`.
 
 ## Architecture (summary)
@@ -96,5 +118,30 @@ Two pipelines that share only the database:
 - One task per store per job; one metrics row per store.
 - Scoring weights are whole numbers that must sum to 100; tier cut-offs must satisfy `0 ≤ medium < large ≤ 100`.
 - Job progress is counted from task rows; there are no counter columns to drift.
+
+### Enrichment engine
+
+Each worker loop (8 by default, inside the API process) repeats:
+
+1. **Take a rate-limit slot.** A Lua script in Redis hands out slots 250 ms apart using Redis' own
+   clock, so every worker and process shares one limit. If Redis is down this fails, and the worker
+   backs off without calling the API (fail closed).
+2. **Claim a task.** `FOR UPDATE SKIP LOCKED` picks the next due `PENDING` task of a `RUNNING` job,
+   sets it `IN_FLIGHT` with a new lease token and a 30 s lease, and counts the attempt. Committed
+   immediately: no transaction stays open during the API call.
+3. **Call the API** with a 10 s timeout. The client never throws; every result is a typed outcome
+   (success, 429, 5xx, 4xx, timeout, network error, invalid body).
+4. **Record the result** in one transaction, guarded by the lease token. Success saves metrics and
+   marks the task `SUCCEEDED`. A failure either schedules a retry with exponential backoff and jitter
+   (0.5–1 s, 1–2 s, 2–4 s … up to 30 s) or fails the task: at once for a 4xx other than 429, or after
+   5 attempts otherwise. A result whose lease was reclaimed changes nothing and is logged as
+   `STALE_IGNORED`.
+5. **Close the job** when no task is pending or in flight, using a conditional update so two workers
+   finishing together can't both close it.
+
+Every attempt is recorded in `enrichment_attempts` (outcome, HTTP status, latency, error).
+
+**Measured against the simulator** (300 stores): finished in 90 s, all succeeded, zero 429s,
+33 transient 500s and 5 hangs all retried successfully, at most 3 attempts for any store.
 
 Full design notes, trade-offs and known limitations will be completed as the phases land.

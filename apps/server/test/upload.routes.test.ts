@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { buildApp } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
 import type { DB } from '../src/db/database.js';
+import type { JobRepository } from '../src/jobs/job.repository.js';
 import type { ParsedStore } from '../src/uploads/csv-parser.js';
 import type { UploadRepository, UploadSummary } from '../src/uploads/upload.repository.js';
 import { HEADER, multipartBody } from './helpers.js';
@@ -39,6 +40,7 @@ describe('upload routes', () => {
       db: {} as DB,
       redis: {} as Redis,
       uploads,
+      jobs: {} as JobRepository,
     });
     await app.ready();
   });

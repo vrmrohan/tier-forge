@@ -13,6 +13,11 @@ const ConfigSchema = z.object({
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
 
   // Enrichment engine
+  /** Run the enrichment workers inside the API process. */
+  RUN_WORKERS: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true'),
   WORKER_CONCURRENCY: z.coerce.number().int().min(1).max(64).default(8),
   /** Kept below the simulator's 5 req/s because its limit is a fixed 1 s window. */
   RATE_LIMIT_PER_SECOND: z.coerce.number().positive().max(5).default(4),
@@ -22,6 +27,8 @@ const ConfigSchema = z.object({
   BACKOFF_BASE_MS: z.coerce.number().int().positive().default(1_000),
   BACKOFF_MAX_MS: z.coerce.number().int().positive().default(30_000),
   /** How long upstream failures must persist before the job is declared systemically broken. */
+  WORKER_IDLE_POLL_MS: z.coerce.number().int().positive().default(500),
+  RATE_LIMIT_PAUSE_MS: z.coerce.number().int().nonnegative().default(1_000),
   BREAKER_WINDOW_MS: z.coerce.number().int().positive().default(30_000),
 });
 

@@ -5,10 +5,15 @@ import type { Database } from './schema.js';
 // node-postgres returns NUMERIC and BIGINT as strings by default, which makes
 // comparisons like `revenue >= bar` silently lexicographic. Parse them once, here.
 // BIGINT ids stay far below Number.MAX_SAFE_INTEGER at this scale.
-const PG_NUMERIC_OID = 1700;
-const PG_INT8_OID = 20;
-pg.types.setTypeParser(PG_NUMERIC_OID, (value) => Number.parseFloat(value));
-pg.types.setTypeParser(PG_INT8_OID, (value) => Number.parseInt(value, 10));
+export const PG_NUMERIC_OID = 1700;
+export const PG_INT8_OID = 20;
+export const numericParsers: Record<number, (value: string) => number> = {
+  [PG_NUMERIC_OID]: (value) => Number.parseFloat(value),
+  [PG_INT8_OID]: (value) => Number.parseInt(value, 10),
+};
+for (const [oid, parser] of Object.entries(numericParsers)) {
+  pg.types.setTypeParser(Number(oid), parser);
+}
 
 export type DB = Kysely<Database>;
 
