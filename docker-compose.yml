@@ -1,0 +1,56 @@
+# Local infrastructure for TierForge.
+# The app itself (API + worker + web) runs on the host with `npm run dev:*` during development.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: tierforge
+      POSTGRES_PASSWORD: tierforge
+      POSTGRES_DB: tierforge
+    ports:
+      - '5432:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U tierforge -d tierforge']
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - '6379:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  # The provided Enrichment API simulator, run unmodified from its own folder.
+  # Override the location with SIMULATOR_DIR if it lives elsewhere.
+  simulator:
+    image: python:3.12-slim
+    working_dir: /app
+    volumes:
+      - ${SIMULATOR_DIR:-../enrichment_simulator}:/app:ro
+    command: >
+      sh -c "pip install --no-cache-dir --quiet -r requirements.txt &&
+             uvicorn main:app --host 0.0.0.0 --port 8000"
+    ports:
+      - '8000:8000'
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'python',
+          '-c',
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')",
+        ]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  pgdata:

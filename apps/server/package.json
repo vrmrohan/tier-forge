@@ -1,0 +1,27 @@
+{
+  "name": "@tierforge/server",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch --env-file-if-exists=../../.env src/index.ts",
+    "start": "node --env-file-if-exists=../../.env dist/index.js",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "db:migrate": "tsx --env-file-if-exists=../../.env src/db/migrate.ts",
+    "db:migrate:down": "tsx --env-file-if-exists=../../.env src/db/migrate.ts down"
+  },
+  "dependencies": {
+    "fastify": "^5.12.5",
+    "ioredis": "^6.0.0",
+    "kysely": "^0.29.6",
+    "pg": "^8.23.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "@types/pg": "^8.23.1",
+    "tsx": "^4.23.15",
+    "typescript": "~6.0.3"
+  }
+}
