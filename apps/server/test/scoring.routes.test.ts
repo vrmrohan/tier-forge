@@ -8,7 +8,7 @@ import type { DB } from '../src/db/database.js';
 import { createJobRepository } from '../src/jobs/job.repository.js';
 import { createScoringRepository } from '../src/scoring/scoring.repository.js';
 import { createUploadRepository } from '../src/uploads/upload.repository.js';
-import { createTestDb } from './test-db.js';
+import { createTestDb, noNotifications } from './test-db.js';
 import { resetJobs, seedEnrichedJob } from './seed.js';
 
 const metrics = [
@@ -30,6 +30,7 @@ describe('scoring routes', () => {
       uploads: createUploadRepository(db),
       jobs: createJobRepository(db),
       scoring: createScoringRepository(db),
+      notifications: noNotifications,
     });
     await app.ready();
   });

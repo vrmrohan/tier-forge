@@ -1,10 +1,4 @@
-import {
-  DEFAULT_SCORING_CONFIG,
-  scoreStore,
-  tierFor,
-  type ScoringConfig,
-  type StoreMetrics,
-} from '@tierforge/shared';
+import { DEFAULT_SCORING_CONFIG, type ScoringConfig, type StoreMetrics } from '@tierforge/shared';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { DB } from '../src/db/database.js';
 import { createScoringRepository } from '../src/scoring/scoring.repository.js';
@@ -57,30 +51,27 @@ describe('scoring (Postgres)', () => {
     ]);
   });
 
-  it('SQL and the shared TypeScript rule agree on every store, boundaries included', async () => {
-    const random = rng(42);
+  it('stores the right score and tier at every bar and cut-off boundary', async () => {
+    // Bars 20,000 / 250,000.50 / 10,000; weights 45 / 35 / 20; Large >= 65, Medium >= 35.
     const config: ScoringConfig = {
       bars: { footfall: 20_000, revenue: 250_000.5, sizeSqft: 10_000 },
       weights: { footfall: 45, revenue: 35, sizeSqft: 20 },
       tiers: { large: 65, medium: 35 },
     };
-    const metrics: StoreMetrics[] = Array.from({ length: 1_000 }, (_, i) => {
-      // Every 10th store sits exactly on a bar or one unit below it.
-      if (i % 10 === 0) {
-        const d = i % 20 === 0 ? 0 : 1;
-        return {
-          footfall: config.bars.footfall - d,
-          revenue: config.bars.revenue - d / 100,
-          sizeSqft: config.bars.sizeSqft - d,
-        };
-      }
-      return {
-        footfall: Math.floor(random() * 50_000),
-        revenue: Math.round(random() * 500_000_00) / 100,
-        sizeSqft: Math.floor(random() * 20_000),
-      };
-    });
-    const jobId = await seedEnrichedJob(db, metrics);
+    const cases: [StoreMetrics, number, string][] = [
+      [{ footfall: 20_000, revenue: 250_000.5, sizeSqft: 10_000 }, 100, 'LARGE'], // exactly on every bar
+      [{ footfall: 19_999, revenue: 250_000.49, sizeSqft: 9_999 }, 0, 'SMALL'], // one unit below each
+      [{ footfall: 20_000, revenue: 250_000.5, sizeSqft: 0 }, 80, 'LARGE'],
+      [{ footfall: 20_000, revenue: 0, sizeSqft: 10_000 }, 65, 'LARGE'], // exactly the Large cut-off
+      [{ footfall: 0, revenue: 250_000.5, sizeSqft: 10_000 }, 55, 'MEDIUM'],
+      [{ footfall: 20_000, revenue: 0, sizeSqft: 0 }, 45, 'MEDIUM'],
+      [{ footfall: 0, revenue: 250_000.5, sizeSqft: 0 }, 35, 'MEDIUM'], // exactly the Medium cut-off
+      [{ footfall: 0, revenue: 0, sizeSqft: 10_000 }, 20, 'SMALL'],
+    ];
+    const jobId = await seedEnrichedJob(
+      db,
+      cases.map(([m]) => m),
+    );
     const scoring = createScoringRepository(db);
 
     const run = await scoring.run(jobId, config);
@@ -89,25 +80,14 @@ describe('scoring (Postgres)', () => {
       runId: run.id,
       sort: 'storeId',
       order: 'asc',
-      limit: 500,
+      limit: 50,
       offset: 0,
     });
-    const rest = await scoring.listStores({
-      jobId,
-      runId: run.id,
-      sort: 'storeId',
-      order: 'asc',
-      limit: 500,
-      offset: 500,
-    });
 
-    const all = [...items, ...rest.items];
-    expect(all).toHaveLength(1_000);
-    for (const store of all) {
-      const expected = scoreStore(store, config);
-      expect(store.score).toBe(expected);
-      expect(store.tier).toBe(tierFor(expected, config.tiers));
-    }
+    expect(items.map((s) => [s.score, s.tier])).toEqual(
+      cases.map(([, score, tier]) => [score, tier]),
+    );
+    expect(run.tiers).toEqual({ LARGE: 3, MEDIUM: 3, SMALL: 2 });
   });
 
   it('scores 5,000 stores in well under a second and can be re-run with new settings', async () => {

@@ -5,7 +5,9 @@ import type { Redis } from 'ioredis';
 import type { Config } from './config.js';
 import type { DB } from './db/database.js';
 import { registerErrorHandler } from './http/errors.js';
-import type { JobRepository } from './jobs/job.repository.js';
+import { JobEventHub, type NotificationSource } from './events/job-event-hub.js';
+import { registerJobEventRoutes, type JobEventsOptions } from './events/job-events.routes.js';
+import type { JobRepository, JobSnapshot } from './jobs/job.repository.js';
 import { registerJobRoutes } from './jobs/job.routes.js';
 import type { ScoringRepository } from './scoring/scoring.repository.js';
 import { registerScoringRoutes } from './scoring/scoring.routes.js';
@@ -22,6 +24,9 @@ export interface AppDeps {
   uploads: UploadRepository;
   jobs: JobRepository;
   scoring: ScoringRepository;
+  /** Source of job-progress notifications (Postgres LISTEN in production). */
+  notifications: NotificationSource;
+  eventsOptions?: JobEventsOptions & { coalesceMs?: number };
 }
 
 type CheckResult = 'ok' | 'down';
@@ -35,7 +40,16 @@ async function check(probe: () => Promise<unknown>): Promise<CheckResult> {
   }
 }
 
-export function buildApp({ config, db, redis, uploads, jobs, scoring }: AppDeps): FastifyInstance {
+export function buildApp({
+  config,
+  db,
+  redis,
+  uploads,
+  jobs,
+  scoring,
+  notifications,
+  eventsOptions,
+}: AppDeps): FastifyInstance {
   const app = Fastify({ logger: { level: config.LOG_LEVEL } });
 
   registerErrorHandler(app);
@@ -62,6 +76,17 @@ export function buildApp({ config, db, redis, uploads, jobs, scoring }: AppDeps)
   registerUploadRoutes(app, uploads);
   registerJobRoutes(app, jobs);
   registerScoringRoutes(app, jobs, scoring);
+
+  // Live job progress over SSE, driven by Postgres NOTIFY. Lives and dies with the app.
+  const events = new JobEventHub<JobSnapshot>({
+    source: notifications,
+    loadSnapshot: (id) => jobs.snapshot(id),
+    logger: app.log,
+    ...(eventsOptions?.coalesceMs !== undefined ? { coalesceMs: eventsOptions.coalesceMs } : {}),
+  });
+  registerJobEventRoutes(app, jobs, events, eventsOptions);
+  app.addHook('onReady', () => events.start());
+  app.addHook('onClose', () => events.close());
 
   return app;
 }

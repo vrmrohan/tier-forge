@@ -1,8 +1,10 @@
-import type { ScoringConfig, Tier } from '@tierforge/shared';
-import { sql } from 'kysely';
+import { scoreStore, tierFor, type ScoringConfig, type Tier } from '@tierforge/shared';
 import type { DB } from '../db/database.js';
 import type { ScoringConfigsTable } from '../db/schema.js';
 import type { Selectable } from 'kysely';
+
+// 4 bound parameters per row; well under Postgres' 65,535 parameter limit.
+const INSERT_CHUNK_SIZE = 1_000;
 
 export interface TierCounts {
   LARGE: number;
@@ -71,7 +73,7 @@ export function createScoringRepository(db: DB) {
 
   return {
     /**
-     * Scores every enriched store of a job in one set-based statement.
+     * Scores every enriched store of a job with the shared scoring rule and stores the results.
      * Reads only store_metrics: never calls the Enrichment API, so it is fast and
      * can be re-run whenever bars, weights or cut-offs change. Each run is saved
      * under its own immutable config, so earlier breakdowns stay reproducible.
@@ -94,23 +96,33 @@ export function createScoringRepository(db: DB) {
           .returningAll()
           .executeTakeFirstOrThrow();
 
-        // Same rule as scoreStore()/tierFor() in @tierforge/shared; a test keeps them in step.
-        await sql`
-          INSERT INTO store_scores (scoring_config_id, store_pk, score, tier)
-          SELECT c.id, m.store_pk, s.score,
-                 CASE WHEN s.score >= c.large_cutoff  THEN 'LARGE'
-                      WHEN s.score >= c.medium_cutoff THEN 'MEDIUM'
-                      ELSE 'SMALL' END
-          FROM store_metrics m
-          JOIN scoring_configs c ON c.id = ${saved.id}
-          CROSS JOIN LATERAL (
-            SELECT (CASE WHEN m.footfall  >= c.footfall_bar THEN c.footfall_weight ELSE 0 END)
-                 + (CASE WHEN m.revenue   >= c.revenue_bar  THEN c.revenue_weight  ELSE 0 END)
-                 + (CASE WHEN m.size_sqft >= c.size_bar     THEN c.size_weight     ELSE 0 END)
-                   AS score
-          ) s
-          WHERE m.job_id = ${jobId}
-        `.execute(trx);
+        // The one implementation of the rule: scoreStore()/tierFor() from @tierforge/shared,
+        // the same functions the web app uses. The database only stores the results.
+        const metrics = await trx
+          .selectFrom('store_metrics')
+          .select(['store_pk', 'footfall', 'revenue', 'size_sqft'])
+          .where('job_id', '=', jobId)
+          .execute();
+
+        const scores = metrics.map((m) => {
+          const score = scoreStore(
+            { footfall: m.footfall, revenue: m.revenue, sizeSqft: m.size_sqft },
+            config,
+          );
+          return {
+            scoring_config_id: saved.id,
+            store_pk: m.store_pk,
+            score,
+            tier: tierFor(score, config.tiers),
+          };
+        });
+
+        for (let i = 0; i < scores.length; i += INSERT_CHUNK_SIZE) {
+          await trx
+            .insertInto('store_scores')
+            .values(scores.slice(i, i + INSERT_CHUNK_SIZE))
+            .execute();
+        }
         return saved;
       });
       return toRun(row);

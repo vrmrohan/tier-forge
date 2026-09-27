@@ -1,5 +1,6 @@
 import { sql } from 'kysely';
 import type { DB } from '../db/database.js';
+import { notifyJobProgress } from '../events/job-notify.js';
 
 export interface ReapResult {
   /** Tasks put back in the queue for another attempt. */
@@ -19,7 +20,7 @@ export interface ReapResult {
  * of them, and a late answer from the lost worker is rejected by the lease-token guard.
  */
 export async function reapExpiredLeases(db: DB, maxAttempts: number): Promise<ReapResult> {
-  const { rows } = await sql<{ status: string }>`
+  const { rows } = await sql<{ status: string; job_id: string }>`
     UPDATE enrichment_tasks
     SET status = CASE WHEN attempts >= ${maxAttempts} THEN 'FAILED' ELSE 'PENDING' END,
         lease_token = NULL,
@@ -33,8 +34,13 @@ export async function reapExpiredLeases(db: DB, maxAttempts: number): Promise<Re
         last_http_status = NULL,
         updated_at = now()
     WHERE status = 'IN_FLIGHT' AND lease_expires_at < now()
-    RETURNING status
+    RETURNING status, job_id
   `.execute(db);
+  if (rows.length)
+    await notifyJobProgress(
+      db,
+      rows.map((r) => r.job_id),
+    );
 
   return {
     requeued: rows.filter((r) => r.status === 'PENDING').length,

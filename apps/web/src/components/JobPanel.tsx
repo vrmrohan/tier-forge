@@ -2,6 +2,7 @@ import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { useEffect, useState } from 'react';
 import { api, isTerminal, type JobStatus, type Progress } from '../api';
 import { ago, duration, fmt, pct } from '../format';
+import { FALLBACK_POLL_MS, useJobEvents, type LiveState } from '../useJobEvents';
 import { ErrorNote, Section } from './Section';
 
 const STATUS: Record<JobStatus, { label: string; icon: string; tone: string }> = {
@@ -62,13 +63,16 @@ function ProgressBar({ p }: { p: Progress }) {
 }
 
 export function JobPanel({ jobId }: { jobId: string }) {
-  const query = useQuery({
+  const query = useQuery({ queryKey: ['job', jobId], queryFn: () => api.getJob(jobId) });
+  const running = !!query.data && !isTerminal(query.data.job.status);
+  // Live updates come over SSE. Polling is only a fallback while the stream is down.
+  const live = useJobEvents(jobId, running);
+  useQuery({
     queryKey: ['job', jobId],
     queryFn: () => api.getJob(jobId),
-    // Poll while the job runs; stop once it reaches a final state.
-    refetchInterval: (q) => (q.state.data && isTerminal(q.state.data.job.status) ? false : 2000),
+    enabled: running && live === 'fallback',
+    refetchInterval: FALLBACK_POLL_MS,
   });
-  const running = !!query.data && !isTerminal(query.data.job.status);
   const now = useNow(running);
 
   if (query.error) {
@@ -131,6 +135,7 @@ export function JobPanel({ jobId }: { jobId: string }) {
       <p className="hint">
         {pct(done, p.total)} processed · running for {duration(job.startedAt, job.finishedAt)}
         {running && <> · last progress {ago(job.lastProgressAt, now)}</>}
+        {running && <LiveIndicator state={live} />}
       </p>
 
       {job.status === 'FAILED_SYSTEMIC' && job.terminalReason && (
@@ -143,6 +148,25 @@ export function JobPanel({ jobId }: { jobId: string }) {
       {p.failed + p.aborted > 0 && <FailuresTable jobId={jobId} total={p.failed + p.aborted} />}
     </Section>
   );
+}
+
+function LiveIndicator({ state }: { state: LiveState }) {
+  if (state === 'live') {
+    return (
+      <span className="live live-on" title="Updates are pushed by the server as they happen">
+        {' · '}
+        <span aria-hidden="true">●</span> Live
+      </span>
+    );
+  }
+  if (state === 'fallback') {
+    return (
+      <span className="live live-off" title="Live connection unavailable; refreshing periodically">
+        {' · '}Refreshing every {FALLBACK_POLL_MS / 1000} s
+      </span>
+    );
+  }
+  return <span className="live"> · Connecting…</span>;
 }
 
 const PAGE = 20;

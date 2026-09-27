@@ -6,6 +6,7 @@ import { createHttpEnrichmentClient } from './enrichment/enrichment-client.js';
 import { createRedisRateLimiter } from './enrichment/rate-limiter.js';
 import { createTaskQueue } from './enrichment/task-queue.js';
 import { WorkerPool } from './enrichment/worker-pool.js';
+import { createPgNotificationSource } from './events/job-event-hub.js';
 import { createJobRepository } from './jobs/job.repository.js';
 import { createRedis, waitForRedis } from './redis.js';
 import { createScoringRepository } from './scoring/scoring.repository.js';
@@ -22,6 +23,7 @@ async function main(): Promise<void> {
     uploads: createUploadRepository(db),
     jobs: createJobRepository(db),
     scoring: createScoringRepository(db),
+    notifications: createPgNotificationSource(config.DATABASE_URL),
   });
 
   const workers = config.RUN_WORKERS

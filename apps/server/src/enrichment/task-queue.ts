@@ -1,5 +1,6 @@
 import { sql } from 'kysely';
 import type { DB } from '../db/database.js';
+import { notifyJobProgress } from '../events/job-notify.js';
 import type { AttemptOutcome } from '../db/schema.js';
 import type { StoreInput, StoreMetrics } from './types.js';
 
@@ -167,6 +168,7 @@ export function createTaskQueue(db: DB) {
           .set({ last_progress_at: sql`now()` })
           .where('id', '=', task.jobId)
           .execute();
+        await notifyJobProgress(trx, task.jobId); // delivered on commit
         return 'saved';
       });
     },
@@ -230,6 +232,7 @@ export function createTaskQueue(db: DB) {
             .where('id', '=', task.jobId)
             .execute();
         }
+        await notifyJobProgress(trx, task.jobId); // delivered on commit
         return 'saved';
       });
     },

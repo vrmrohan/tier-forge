@@ -9,6 +9,7 @@ import type { ScoringRepository } from '../src/scoring/scoring.repository.js';
 import type { ParsedStore } from '../src/uploads/csv-parser.js';
 import type { UploadRepository, UploadSummary } from '../src/uploads/upload.repository.js';
 import { HEADER, multipartBody } from './helpers.js';
+import { noNotifications } from './test-db.js';
 
 /** In-memory repository: route tests exercise HTTP + parsing without a database. */
 class FakeUploads implements UploadRepository {
@@ -43,6 +44,7 @@ describe('upload routes', () => {
       uploads,
       jobs: {} as JobRepository,
       scoring: {} as ScoringRepository,
+      notifications: noNotifications,
     });
     await app.ready();
   });

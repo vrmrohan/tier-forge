@@ -60,8 +60,9 @@ Stop the infrastructure with `npm run infra:down` (add `-v` to `docker compose d
 One page, four steps, at `http://localhost:5173`:
 
 1. **Upload store list.** Header problems are listed by column; skipped rows show their line and reason.
-2. **Enrichment.** Live progress (polls every 2 s): enriched, failed, pending and in flight, with the
-   time since the last progress. Failed stores are listed with attempts and the reason. A
+2. **Enrichment.** Live progress pushed over Server-Sent Events (falls back to polling every 5 s
+   only while the stream is unavailable): enriched, failed, pending and in flight, with the time
+   since the last progress. Failed stores are listed with attempts and the reason. A
    systemically stopped job shows why.
 3. **Score & tier.** Bars, weights and cut-offs, checked while you type with the same rules the API
    uses (`@tierforge/shared`), e.g. the weight total turns red until it reaches 100%. Can run
@@ -109,6 +110,17 @@ curl -X POST localhost:3000/jobs -H 'content-type: application/json' -d '{"uploa
 Job status (`RUNNING`, `COMPLETED`, `COMPLETED_WITH_FAILURES`, `FAILED_SYSTEMIC`) and live counts:
 `total`, `pending`, `inFlight`, `succeeded`, `failed`, `aborted`, plus `lastProgressAt`.
 
+### `GET /jobs/:id/events` (Server-Sent Events)
+
+Live progress for one job. Sends `event: progress` with `{ job, progress }` on connect and on every
+change, then `event: done` when the job reaches a final state, and closes. A `: ping` comment every
+15 s keeps proxies from dropping an idle stream; `retry: 5000` tells the browser how soon to
+reconnect.
+
+```bash
+curl -N localhost:3000/jobs/<jobId>/events
+```
+
 ### `GET /jobs/:id/failures?limit=50&offset=0`
 
 Stores that ultimately failed, each with attempts, the last HTTP status and the reason.
@@ -120,7 +132,7 @@ The 20 most recent jobs.
 ### `POST /jobs/:id/scoring-runs`
 
 Scores and tiers every enriched store. Reads stored metrics only (never calls the Enrichment API),
-runs as one SQL statement, and can be repeated whenever the settings change.
+runs in one transaction, and can be repeated whenever the settings change.
 
 ```json
 {
@@ -157,8 +169,8 @@ Two pipelines that share only the database:
   `FOR UPDATE SKIP LOCKED` under a time-limited lease, call the API through a Redis rate limiter
   (4 calls/s, evenly spaced, below the simulator's fixed-window 5 req/s), and write results guarded by the
   lease token so late responses from reclaimed attempts are discarded.
-- **Scoring (fast, deterministic):** one set-based SQL pass over stored metrics. Never calls the API and
-  can be re-run any time.
+- **Scoring (fast, deterministic):** one pass over stored metrics with the shared scoring function.
+  Never calls the API and can be re-run any time.
 
 ### Schema decisions already enforced by the database
 
@@ -217,12 +229,24 @@ Every attempt is recorded in `enrichment_attempts` (outcome, HTTP status, latenc
 | Simulator down for good                                              | Breaker tripped after 30 s (123 failures in a row); job `FAILED_SYSTEMIC`, 304 tasks `ABORTED`              |
 | Two worker processes with separate in-process limiters (by accident) | ~8 calls/s, so 429s; still no duplicates and all succeeded. This is why the real limiter is shared in Redis |
 
+### Live progress (SSE)
+
+Nothing polls the database for progress. Every transaction that changes it (a recorded result, a
+reaped lease, a job closing, a systemic stop) also runs `pg_notify('job_progress', jobId)`, which
+Postgres delivers only when that transaction commits. The API holds one `LISTEN` connection per
+process and fans notifications out to open streams, coalescing bursts to at most one snapshot query
+per job every 500 ms. It works across worker processes because the signal travels through Postgres.
+If the `LISTEN` connection drops, it reconnects and refreshes every watched job once. The browser
+uses `EventSource`; while the stream is down it polls `GET /jobs/:id` every 5 s instead.
+
 ### Scoring
 
 Scoring is deliberately separate from enrichment: it reads only `store_metrics` and writes only
-`scoring_configs` + `store_scores`. The rule exists twice on purpose: as one set-based SQL statement
-(fast: 5,000 stores well under a second) and as a pure TypeScript function in `@tierforge/shared`
-(used by tests and the web app). A test scores 1,000 random stores, including values exactly on and
-one unit below each bar, both ways and requires identical results.
+`scoring_configs` + `store_scores`. The rule lives in exactly one place, `scoreStore()` / `tierFor()`
+in `@tierforge/shared`. A scoring run loads the job's metrics, applies those functions in Node and
+bulk-inserts the results (1,000 rows per statement) in one transaction; 5,000 stores take a few
+hundred milliseconds. The web app uses the same functions to mark which bars a store clears, so the
+dashboard and the stored tiers can't disagree. Validation is layered on purpose: the shared Zod
+schema (form and API) plus database `CHECK` constraints as a backstop.
 
 Full design notes, trade-offs and known limitations will be completed as the phases land.

@@ -280,6 +280,16 @@ details summary {
 .progress-rest {
   background: var(--track);
 }
+.live-on span {
+  color: var(--good);
+}
+.live-on {
+  color: var(--good-ink);
+  font-weight: 600;
+}
+.live-off {
+  color: var(--warning);
+}
 .stats {
   display: flex;
   flex-wrap: wrap;

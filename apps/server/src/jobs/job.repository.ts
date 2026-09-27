@@ -1,6 +1,7 @@
 import { sql } from 'kysely';
 import type { DB } from '../db/database.js';
 import type { EnrichmentJob, JobStatus, TaskStatus } from '../db/schema.js';
+import { notifyJobProgress } from '../events/job-notify.js';
 import { AppError, notFound } from '../http/errors.js';
 
 export interface JobProgress {
@@ -23,6 +24,15 @@ export interface JobView {
   finishedAt: Date | null;
   terminalReason: string | null;
 }
+
+/** What the dashboard shows for a job: the job row plus live counts. */
+export interface JobSnapshot {
+  job: JobView;
+  progress: JobProgress;
+}
+
+export const isTerminalStatus = (status: JobStatus): boolean =>
+  status === 'COMPLETED' || status === 'COMPLETED_WITH_FAILURES' || status === 'FAILED_SYSTEMIC';
 
 export interface FailedStore {
   storeId: string;
@@ -120,6 +130,11 @@ export function createJobRepository(db: DB) {
       return jobs.map(toView);
     },
 
+    async snapshot(jobId: string): Promise<JobSnapshot | undefined> {
+      const job = await this.findById(jobId);
+      return job && { job, progress: await this.progress(jobId) };
+    },
+
     /** Counted from task rows every time, so it can never drift from reality. */
     async progress(jobId: string): Promise<JobProgress> {
       const rows = await db
@@ -195,7 +210,7 @@ export type JobRepository = ReturnType<typeof createJobRepository>;
  * guard makes concurrent calls safe; only one of them changes the row.
  */
 export async function finalizeFinishedJobs(db: DB): Promise<number> {
-  const result = await sql`
+  const { rows } = await sql<{ id: string }>`
     UPDATE enrichment_jobs j
     SET status = CASE
           WHEN EXISTS (SELECT 1 FROM enrichment_tasks t
@@ -207,8 +222,14 @@ export async function finalizeFinishedJobs(db: DB): Promise<number> {
     WHERE j.status = 'RUNNING'
       AND NOT EXISTS (SELECT 1 FROM enrichment_tasks t
                       WHERE t.job_id = j.id AND t.status IN ('PENDING', 'IN_FLIGHT'))
+    RETURNING j.id
   `.execute(db);
-  return Number(result.numAffectedRows ?? 0);
+  if (rows.length)
+    await notifyJobProgress(
+      db,
+      rows.map((r) => r.id),
+    );
+  return rows.length;
 }
 
 /**
@@ -243,6 +264,7 @@ export async function failRunningJobsSystemically(db: DB, reason: string): Promi
         .where('job_id', 'in', ids)
         .where('status', 'in', ['PENDING', 'IN_FLIGHT'])
         .execute();
+      await notifyJobProgress(trx, ids); // delivered on commit
     }
     return ids;
   });
