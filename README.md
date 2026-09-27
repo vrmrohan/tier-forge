@@ -4,7 +4,7 @@ Resilient bulk store scoring and tiering. TierForge ingests a CSV of stores, enr
 rate-limited and flaky Enrichment API, then scores and tiers every store (Large / Medium / Small) from
 user-configured bars and weights.
 
-> Status: Phase 4 done (CSV upload, resilient enrichment, scoring and tiering). Next: web dashboard. Features land phase by phase.
+> Status: Phases 1–5 done: CSV upload, resilient enrichment, scoring and tiering, web dashboard. Features land phase by phase.
 
 ## Prerequisites
 
@@ -25,8 +25,8 @@ cp .env.example .env
 npm install
 npm run infra:up          # Postgres :5432, Redis :6379, simulator :8000
 npm run db:migrate        # create the schema
-npm run dev:server        # API on :3000
-curl localhost:3000/health
+npm run dev:server        # API on :3000 (terminal 1)
+npm run dev:web           # dashboard on http://localhost:5173 (terminal 2)
 ```
 
 Stop the infrastructure with `npm run infra:down` (add `-v` to `docker compose down` to wipe the database).
@@ -39,7 +39,7 @@ Stop the infrastructure with `npm run infra:down` (add `-v` to `docker compose d
 | `apps/server/src/db/migrations` | Kysely migrations; the schema's source of truth               |
 | `packages/shared`               | Scoring rules and config validation shared by API and web app |
 | `apps/server/src/db/schema.ts`  | Table types used by Kysely, kept in sync with migrations      |
-| `apps/web` _(Phase 5)_          | React + Vite dashboard                                        |
+| `apps/web`                      | React + Vite dashboard                                        |
 | `docker-compose.yml`            | Postgres 16, Redis 7 and the simulator                        |
 
 ## Scripts
@@ -49,10 +49,28 @@ Stop the infrastructure with `npm run infra:down` (add `-v` to `docker compose d
 | `npm run infra:up`     | Start Postgres, Redis and the simulator                                                                                                                       |
 | `npm run db:migrate`   | Apply all migrations                                                                                                                                          |
 | `npm run dev:server`   | Run the API with reload                                                                                                                                       |
+| `npm run dev:web`      | Run the dashboard (proxies `/api` to the API)                                                                                                                 |
 | `npm test`             | Unit + Postgres tests (in-process PGlite, no Docker needed); the Redis limiter test also runs when Redis is reachable on `localhost:6379` or `TEST_REDIS_URL` |
 | `npm run typecheck`    | TypeScript checks for every workspace                                                                                                                         |
 | `npm run lint`         | ESLint                                                                                                                                                        |
 | `npm run format:check` | Prettier                                                                                                                                                      |
+
+## Dashboard
+
+One page, four steps, at `http://localhost:5173`:
+
+1. **Upload store list.** Header problems are listed by column; skipped rows show their line and reason.
+2. **Enrichment.** Live progress (polls every 2 s): enriched, failed, pending and in flight, with the
+   time since the last progress. Failed stores are listed with attempts and the reason. A
+   systemically stopped job shows why.
+3. **Score & tier.** Bars, weights and cut-offs, checked while you type with the same rules the API
+   uses (`@tierforge/shared`), e.g. the weight total turns red until it reaches 100%. Can run
+   mid-job; the page says how many stores were enriched since.
+4. **Results.** Tier counts, a 100% bar, and the store list: filter by tier, sort by any metric or
+   score, paginated. Each metric shows `✓+N` when the store clears that bar and the weight it adds.
+
+The job being viewed is in the URL (`?job=…`), so a reload or a shared link keeps it. Works in light
+and dark mode and down to 320 px wide.
 
 ## API
 
