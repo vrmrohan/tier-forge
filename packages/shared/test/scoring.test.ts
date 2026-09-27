@@ -73,6 +73,28 @@ describe('ScoringConfigSchema', () => {
     ]);
   });
 
+  it('accepts every revenue bar with at most 2 decimals, despite floating point', () => {
+    // Values like these used to fail because e.g. 1.1 * 100 !== 110 in floating point.
+    const bad: number[] = [];
+    for (const whole of [0, 1, 999, 150_000, 12_345_678]) {
+      for (let cents = 0; cents < 100; cents++) {
+        const revenue = Number(`${whole}.${String(cents).padStart(2, '0')}`);
+        if (issues({ ...config, bars: { ...config.bars, revenue } }).length) bad.push(revenue);
+      }
+    }
+    expect(bad).toEqual([]);
+    expect(issues({ ...config, bars: { ...config.bars, revenue: 1.1 } })).toEqual([]);
+    expect(issues({ ...config, bars: { ...config.bars, revenue: 150_000.05 } })).toEqual([]);
+  });
+
+  it('still rejects a third decimal place', () => {
+    for (const revenue of [0.001, 1.005, 150_000.051, 0.1 + 0.2]) {
+      expect(issues({ ...config, bars: { ...config.bars, revenue } })).toEqual([
+        'bars.revenue: at most 2 decimals',
+      ]);
+    }
+  });
+
   it('rejects negative bars, out-of-range values and extra cents', () => {
     expect(issues({ ...config, bars: { ...config.bars, footfall: -1 } })).toHaveLength(1);
     expect(issues({ ...config, tiers: { large: 101, medium: 40 } })).toHaveLength(1);

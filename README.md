@@ -4,7 +4,8 @@ Resilient bulk store scoring and tiering. TierForge ingests a CSV of stores, enr
 rate-limited and flaky Enrichment API, then scores and tiers every store (Large / Medium / Small) from
 user-configured bars and weights.
 
-> Status: Phases 1–5 done: CSV upload, resilient enrichment, scoring and tiering, web dashboard. Features land phase by phase.
+> Status: complete for the brief: CSV upload, resilient enrichment, scoring and tiering, and a live web dashboard.
+> Not production-hardened yet; see [Known limitations](#known-limitations) and [Path to production](#path-to-production).
 
 ## Prerequisites
 
@@ -176,7 +177,7 @@ Two pipelines that share only the database:
 
 - Only one `QUEUED`/`RUNNING` job at a time (partial unique index).
 - A task is leased if and only if it is `IN_FLIGHT` (check constraint).
-- One task per store per job; one metrics row per store.
+- One task per store per job; one metrics row per store per job.
 - Scoring weights are whole numbers that must sum to 100; tier cut-offs must satisfy `0 ≤ medium < large ≤ 100`.
 - Job progress is counted from task rows; there are no counter columns to drift.
 
@@ -197,8 +198,10 @@ Each worker loop (8 by default, inside the API process) repeats:
    (0.5–1 s, 1–2 s, 2–4 s … up to 30 s) or fails the task: at once for a 4xx other than 429, or after
    5 attempts otherwise. A result whose lease was reclaimed changes nothing and is logged as
    `STALE_IGNORED`.
-5. **Close the job** when no task is pending or in flight, using a conditional update so two workers
-   finishing together can't both close it.
+5. **Close the job** once no task is pending or in flight: it becomes `COMPLETED` or
+   `COMPLETED_WITH_FAILURES`. The check runs after each result commits, so the last finished task
+   always sees the job as done. A conditional update (`WHERE status = 'RUNNING'`) makes sure only
+   one worker closes it, even if two finish at the same moment.
 
 Two background safeguards run alongside the workers:
 
@@ -216,7 +219,11 @@ Two background safeguards run alongside the workers:
 became due when the job started, so a task scheduled for a retry runs after the fresh work ahead of it.
 New stores keep flowing and retries get natural extra spacing; the tail of a job is mostly retries.
 
-Every attempt is recorded in `enrichment_attempts` (outcome, HTTP status, latency, error).
+Every attempt is also recorded in `enrichment_attempts` (outcome, HTTP status, latency, error). This table
+is an addition beyond the brief and is **write-only**: no endpoint, screen or retry decision reads it, because
+everything the engine needs lives on the task row. It exists for debugging (why did a store fail after 5
+tries?), for the measurements below, and as proof that stale answers were discarded (`STALE_IGNORED`).
+Dropping it would not change how the system behaves.
 
 ### Measured against the simulator
 
@@ -249,4 +256,121 @@ hundred milliseconds. The web app uses the same functions to mark which bars a s
 dashboard and the stored tiers can't disagree. Validation is layered on purpose: the shared Zod
 schema (form and API) plus database `CHECK` constraints as a backstop.
 
-Full design notes, trade-offs and known limitations will be completed as the phases land.
+### Data model
+
+| Table                 | One row per                    | Notes                                                                                                                           |
+| --------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| `uploads`             | uploaded CSV                   | filename and accepted row count                                                                                                 |
+| `stores`              | valid CSV row                  | unique `(upload_id, store_id)`                                                                                                  |
+| `enrichment_jobs`     | enrichment run over one upload | status, timestamps, `terminal_reason`; partial unique index allows one active job                                               |
+| `enrichment_tasks`    | store in a job                 | current state: status, attempts, `next_attempt_at`, lease token and expiry, last error                                          |
+| `enrichment_attempts` | API call                       | optional, write-only history: outcome, HTTP status, latency, error; never read by the engine                                    |
+| `store_metrics`       | enriched store per job         | footfall, revenue (`numeric(14,2)`), size; primary key `(job_id, store_pk)` (migration 0002), so each job keeps its own results |
+| `scoring_configs`     | scoring run                    | immutable bars, weights and cut-offs                                                                                            |
+| `store_scores`        | store in a scoring run         | score and tier; primary key `(scoring_config_id, store_pk)`                                                                     |
+
+All foreign keys use `ON DELETE CASCADE`. Migrations live in `apps/server/src/db/migrations`.
+
+## Configuration
+
+Every setting is an environment variable, validated at startup (`apps/server/src/config.ts`); the
+server refuses to start on an invalid value. Defaults are in `.env.example`.
+
+| Variable                                     | Default                | Meaning                                                                           |
+| -------------------------------------------- | ---------------------- | --------------------------------------------------------------------------------- |
+| `DATABASE_URL`, `REDIS_URL`, `SIMULATOR_URL` | local compose services | Where Postgres, Redis and the Enrichment API are                                  |
+| `PORT`, `LOG_LEVEL`                          | `3000`, `info`         | API port and log level                                                            |
+| `RUN_WORKERS`                                | `true`                 | Run enrichment workers in this process; set `false` for an API-only process       |
+| `WORKER_CONCURRENCY`                         | `8`                    | Worker loops per process (1–64). Throughput is capped by the rate limit, not this |
+| `RATE_LIMIT_PER_SECOND`                      | `4`                    | Shared calls per second across all processes (max 5)                              |
+| `REQUEST_TIMEOUT_MS`                         | `10000`                | Per-call timeout; must be shorter than `LEASE_MS`                                 |
+| `LEASE_MS`                                   | `30000`                | How long a claimed task belongs to one worker before the reaper may take it back  |
+| `MAX_ATTEMPTS`                               | `5`                    | Attempts per store before it is marked `FAILED`                                   |
+| `BACKOFF_BASE_MS`, `BACKOFF_MAX_MS`          | `1000`, `30000`        | Retry backoff: doubles per attempt with jitter, capped                            |
+| `BREAKER_WINDOW_MS`, `BREAKER_MIN_FAILURES`  | `30000`, `10`          | Stop the job only after this long and this many upstream failures with no success |
+| `REAPER_INTERVAL_MS`                         | `5000`                 | How often expired leases are reclaimed                                            |
+| `WORKER_IDLE_POLL_MS`, `RATE_LIMIT_PAUSE_MS` | `500`, `1000`          | Idle wait when the queue is empty; pause after a 429 or when Redis is unavailable |
+
+## Testing
+
+```bash
+npm test
+```
+
+Runs every workspace's Vitest suite. Database tests use PGlite (Postgres compiled to WebAssembly,
+in-process), so no Docker is needed and every test gets a fresh, migrated database. The Redis limiter
+test runs only when Redis is reachable (`localhost:6379` or `TEST_REDIS_URL`) and is skipped otherwise.
+
+| Area              | What is proven                                                                                                                     |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| CSV upload        | header rules (BOM, case, order, missing/extra/duplicate columns), row rejects with line numbers, size limits                       |
+| Enrichment client | every outcome is typed: success, 429, 5xx, 4xx, timeout, network error, invalid body                                               |
+| Retry policy      | backoff ranges, attempt cap, 4xx fails fast                                                                                        |
+| Task queue        | each task is claimed exactly once; a late result after reclaim is ignored; retries are not handed out early                        |
+| Worker pool       | end to end through transient failures with no duplicates; attempt cap; a worker dying mid-call; no calls while the limiter is down |
+| Lease reaper      | expired leases go back to `PENDING` or `FAILED` on the last attempt; a late answer after reaping changes nothing                   |
+| Circuit breaker   | ignores 429s and normal noise; trips only on a sustained outage; aborts unfinished tasks                                           |
+| Rate limiter      | slots are evenly spaced and shared across clients (real Redis)                                                                     |
+| Live progress     | notifications arrive only on commit; bursts are coalesced; `LISTEN` reconnects; the stream sends a snapshot, updates and `done`    |
+| Scoring           | boundary values (exactly on a bar and a cut-off), validation messages, repeatable runs, API responses                              |
+
+`npm run typecheck`, `npm run lint` and `npm run format:check` must also pass.
+
+## Design decisions and trade-offs
+
+| Decision                                                     | Why                                                                                                           | Cost                                                                                        |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| Postgres is both the source of truth and the queue           | Task state and results change in one transaction, so nothing is lost or double-counted; one less system       | Fine for thousands of tasks per second; a very large system would move to a dedicated queue |
+| Redis only for the rate limiter                              | The limit must be shared by every worker and process; Redis' clock and a Lua script make it exact             | One more service; if Redis is down, enrichment pauses (fails closed) rather than risk 429s  |
+| 4 calls/s, evenly spaced, not 5                              | The simulator counts a fixed 1 s window and rejected calls count too; bursts at the edge cause 429 storms     | 20% less peak throughput; in return, zero 429s in every measured run                        |
+| Leases instead of long transactions                          | No database connection is held during a 50 s hang; a crashed worker's task comes back automatically           | A late answer can arrive after reclaim, so every write is guarded by the lease token        |
+| Retries wait behind fresh work                               | New stores keep flowing during a burst of 500s, and retries get natural spacing                               | The last few minutes of a job are mostly retries                                            |
+| Circuit breaker counts only 5xx, timeouts and network errors | 429s and 4xx describe our requests, not the API's health; ~12% noise must never stop a job                    | A real outage is detected after 30 s, not instantly                                         |
+| Scoring is a separate step over stored metrics               | Re-scoring with new bars takes milliseconds and never calls the slow API                                      | A score reflects the metrics stored when it ran; it can be re-run any time                  |
+| One scoring function shared by API and web app               | The dashboard and the stored tiers cannot disagree                                                            | Scoring runs in Node rather than inside one SQL statement (5,000 stores still take < 1 s)   |
+| Each scoring run is stored with its own immutable settings   | Earlier breakdowns stay reproducible                                                                          | `store_scores` grows by one row per store per run                                           |
+| SSE driven by `pg_notify`, polling only as a fallback        | No per-client polling of the database; works across worker processes because the signal goes through Postgres | One extra `LISTEN` connection per API process                                               |
+| One active job at a time                                     | Enforced by a partial unique index; keeps the rate limit and progress easy to reason about                    | A second upload has to wait (409)                                                           |
+
+## Known limitations
+
+- **Failed stores can't be retried in place.** Stores that fail after 5 attempts are listed with the reason, but
+  re-running them means a new job. A `FAILED_SYSTEMIC` job can't be resumed or cancelled either.
+- **One job at a time**, for the whole system.
+- **No reuse across uploads.** The API is deterministic per `store_id`, but uploading the same file again calls it
+  again for every store.
+- **Workers run in the API process by default.** A restart pauses enrichment briefly; in-flight tasks are
+  reclaimed by the reaper after their lease (≤ 30 s). `RUN_WORKERS=false` allows separate API and worker processes,
+  but no deployment for that is provided.
+- **A job can wait indefinitely** if Redis stays down: it is safe (no calls, nothing lost) but nothing alerts anyone.
+- **Tables only grow.** There is no retention for `enrichment_attempts` or old scoring runs, and no delete endpoint.
+- **Throughput is bounded by the API**: about 4 stores/s, so 5,000 stores take ~24 min and 100,000 would take ~7 h.
+- **Local-only setup**: the server runs through `tsx`, the dashboard through the Vite dev server, and migrations are
+  run by hand.
+
+## Path to production
+
+In the order I would do them:
+
+1. **Authentication and authorization** on every endpoint, plus request-size and per-client rate limits.
+2. **Operations visibility:** metrics (queue depth, calls/s, 429 and 5xx rates, breaker trips, job duration),
+   alerts on a job with no progress, and a `/health` check that includes worker liveness.
+3. **Retry failed stores and cancel a job** (small API additions on top of the existing task states).
+4. **Separate API and worker deployments** with a production build (compiled server, static dashboard), Dockerfiles,
+   CI running the checks above, and migrations run by the pipeline.
+5. **Managed Postgres and Redis** with backups and failover; real secrets and TLS instead of the compose defaults.
+6. **Reuse metrics across uploads** for the same `store_id` within a freshness window.
+7. **Multiple concurrent jobs** sharing the one rate limit, with fair scheduling between them.
+8. **Retention** for attempts history and old scoring runs.
+
+## Troubleshooting
+
+| Problem                                            | Fix                                                                                                                                         |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `esbuild` / `tsx` "platform" error on startup      | `node_modules` was installed on another OS (e.g. Linux vs macOS). Delete `node_modules` in the root and every workspace, then `npm install` |
+| Port 3000, 5173, 5432, 6379 or 8000 already in use | Stop the other process, or change `PORT` / the compose port mappings and the matching URLs in `.env`                                        |
+| `/health` returns `503`                            | Postgres or Redis is not reachable; `npm run infra:up` and check `docker compose ps`                                                        |
+| Job progress stalls, logs say Redis is unavailable | Expected fail-closed behaviour: workers wait. Start Redis and progress resumes on its own                                                   |
+| Job ends `FAILED_SYSTEMIC`                         | The simulator was unreachable or failing for 30 s. `GET /jobs/:id` shows the reason; start the simulator and create a new job               |
+| Why did a store fail?                              | Dashboard step 2 lists failed stores, or `GET /jobs/:id/failures`; every attempt is in `enrichment_attempts`                                |
+| `409 JOB_ALREADY_RUNNING`                          | Only one job runs at a time; wait for it to finish                                                                                          |

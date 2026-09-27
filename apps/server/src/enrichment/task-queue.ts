@@ -144,7 +144,8 @@ export function createTaskQueue(db: DB) {
           return 'stale';
         }
 
-        // DO NOTHING: results are deterministic per store, so an existing row is already correct.
+        // One row per store per job. DO NOTHING: the lease guard above already allows only one
+        // success per task, and results are deterministic per store, so an existing row is correct.
         await trx
           .insertInto('store_metrics')
           .values({
@@ -154,7 +155,7 @@ export function createTaskQueue(db: DB) {
             revenue: metrics.revenue,
             size_sqft: metrics.sizeSqft,
           })
-          .onConflict((oc) => oc.column('store_pk').doNothing())
+          .onConflict((oc) => oc.columns(['job_id', 'store_pk']).doNothing())
           .execute();
 
         await logAttempt(trx, task, {

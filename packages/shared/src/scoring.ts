@@ -29,7 +29,9 @@ export const ScoringConfigSchema = z
     /** Minimum value that counts as strong, per metric. Revenue may have cents. */
     bars: z.object({
       footfall: bar.int('must be a whole number'),
-      revenue: bar.refine((v) => Math.round(v * 100) === v * 100, 'at most 2 decimals'),
+      // Round-trip through a 2-decimal string rather than multiplying by 100: 1.1 * 100 is
+      // 110.00000000000001 in floating point, which would wrongly reject valid amounts.
+      revenue: bar.refine((v) => Number(v.toFixed(2)) === v, 'at most 2 decimals'),
       sizeSqft: bar.int('must be a whole number'),
     }),
     /** Percentage points each cleared bar contributes. Whole numbers summing to 100. */

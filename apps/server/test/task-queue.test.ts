@@ -1,9 +1,11 @@
+import { DEFAULT_SCORING_CONFIG } from '@tierforge/shared';
 import { sql } from 'kysely';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { DB } from '../src/db/database.js';
 import { createTaskQueue } from '../src/enrichment/task-queue.js';
 import { createJobRepository, finalizeFinishedJobs } from '../src/jobs/job.repository.js';
 import { AppError } from '../src/http/errors.js';
+import { createScoringRepository } from '../src/scoring/scoring.repository.js';
 import { createTestDb } from './test-db.js';
 import { resetJobs, seedUpload } from './seed.js';
 
@@ -84,6 +86,28 @@ describe('job repository + task queue (Postgres)', () => {
     const saved = await db.selectFrom('store_metrics').selectAll().execute();
     expect(saved).toHaveLength(3);
     expect(saved[0]?.revenue).toBe(1234.56); // a number, not the string "1234.56"
+  });
+
+  it('a second job over the same upload saves and scores its own metrics', async () => {
+    const enrichAll = async (): Promise<string> => {
+      const job = await jobs().start(uploadId);
+      for (let i = 0; i < 3; i++) {
+        const task = (await queue().claimNext(LEASE_MS))!;
+        expect(await queue().recordSuccess(task, metrics, 10)).toBe('saved');
+      }
+      expect(await finalizeFinishedJobs(db)).toBe(1);
+      return job.id;
+    };
+    const first = await enrichAll();
+    const second = await enrichAll();
+
+    const rowsFor = async (jobId: string) =>
+      db.selectFrom('store_metrics').select('store_pk').where('job_id', '=', jobId).execute();
+    expect(await rowsFor(first)).toHaveLength(3); // the first job keeps its results
+    expect(await rowsFor(second)).toHaveLength(3);
+
+    const run = await createScoringRepository(db).run(second, DEFAULT_SCORING_CONFIG);
+    expect(run.scored).toBe(3);
   });
 
   it('ignores a late result whose lease was reclaimed', async () => {
